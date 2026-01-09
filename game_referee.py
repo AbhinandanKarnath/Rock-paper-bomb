@@ -1,225 +1,251 @@
-import os
+"""
+Rock-Paper-Scissors-Plus Game Referee
+Standalone version without API calls for testing
+"""
+
 import random
-from google import genai
-from google.genai import types
+from typing import Literal
+from pydantic import BaseModel, Field
 
-# --- 1. Game Logic & State (The Engine) ---
-class GameEngine:
-    def __init__(self):
-        self.user_score = 0
-        self.bot_score = 0
-        self.round_count = 0
-        self.max_rounds = 3
-        self.user_bomb_used = False
-        self.bot_bomb_used = False
-        self.game_over = False
+# ============================================================================
+# STATE MODEL
+# ============================================================================
 
-    def get_bot_move(self):
-        # Bot logic: Random, with 10% chance to use bomb if available
-        moves = ["rock", "paper", "scissors"]
-        if not self.bot_bomb_used:
-            if random.random() < 0.1: 
-                return "bomb"
-        return random.choice(moves)
+class GameState(BaseModel):
+    """Tracks the complete game state across rounds"""
+    round_number: int = Field(default=1, ge=1, le=4)  # Allow 4 to track "after round 3"
+    user_score: int = Field(default=0, ge=0)
+    bot_score: int = Field(default=0, ge=0)
+    user_bomb_used: bool = Field(default=False)
+    bot_bomb_used: bool = Field(default=False)
+    game_active: bool = Field(default=True)
+    last_user_move: str = Field(default="")
+    last_bot_move: str = Field(default="")
+    last_result: str = Field(default="")
 
-    def resolve_round(self, user_move: str):
-        """
-        Validates move, plays a round, updates state, and returns result.
-        Args:
-            user_move: The move played by the user (rock, paper, scissors, bomb).
-        """
-        if self.game_over:
-            return {"status": "game_over", "message": "Game is already finished."}
 
-        user_move = user_move.lower().strip()
-        valid_moves = ["rock", "paper", "scissors", "bomb"]
+# ============================================================================
+# GAME LOGIC
+# ============================================================================
+
+VALID_MOVES = {"rock", "paper", "scissors", "bomb"}
+
+def normalize_move(user_input: str) -> str:
+    """Normalize user input to valid move or empty string"""
+    cleaned = user_input.lower().strip()
+    if cleaned in VALID_MOVES:
+        return cleaned
+    return ""
+
+
+def determine_winner(user_move: str, bot_move: str) -> Literal["user", "bot", "draw"]:
+    """Determine round winner based on game rules"""
+    if user_move == bot_move:
+        return "draw"
+    
+    # Bomb logic
+    if user_move == "bomb":
+        return "user"
+    if bot_move == "bomb":
+        return "bot"
+    
+    # Standard RPS logic
+    wins = {
+        "rock": "scissors",
+        "scissors": "paper",
+        "paper": "rock"
+    }
+    
+    if wins.get(user_move) == bot_move:
+        return "user"
+    else:
+        return "bot"
+
+
+def choose_bot_move(state: GameState) -> str:
+    """Bot move selection logic"""
+    available_moves = ["rock", "paper", "scissors"]
+    
+    # Bot uses bomb strategically (e.g., on round 2 if losing)
+    if not state.bot_bomb_used and state.round_number == 2 and state.bot_score < state.user_score:
+        return "bomb"
+    
+    return random.choice(available_moves)
+
+
+# ============================================================================
+# TOOL: UPDATE GAME STATE
+# ============================================================================
+
+def update_game_state(user_input: str, current_state: dict) -> dict:
+    """
+    Tool: Validates user move, resolves round, and updates game state.
+    
+    Args:
+        user_input: Raw user input string
+        current_state: Current game state as dict
         
-        # --- Validation Logic ---
-        if user_move not in valid_moves:
-            self.round_count += 1
-            if self.round_count >= self.max_rounds: self.game_over = True
-            return {
-                "round": self.round_count,
-                "status": "invalid",
-                "message": f"Invalid move '{user_move}'. Round wasted.",
-                "scores": f"User: {self.user_score}, Bot: {self.bot_score}",
-                "game_over": self.game_over
-            }
-
-        if user_move == "bomb":
-            if self.user_bomb_used:
-                self.round_count += 1
-                if self.round_count >= self.max_rounds: self.game_over = True
-                return {
-                    "round": self.round_count,
-                    "status": "invalid",
-                    "message": "Bomb already used! Round wasted.",
-                    "scores": f"User: {self.user_score}, Bot: {self.bot_score}",
-                    "game_over": self.game_over
-                }
-            self.user_bomb_used = True
-
-        # --- Play Round ---
-        bot_move = self.get_bot_move()
-        if bot_move == "bomb": self.bot_bomb_used = True
+    Returns:
+        Updated game state with round results
+    """
+    state = GameState(**current_state)
+    
+    # Validate user move
+    user_move = normalize_move(user_input)
+    
+    # Handle invalid input
+    if not user_move:
+        state.round_number += 1
+        state.last_user_move = user_input
+        state.last_bot_move = ""
+        state.last_result = "Invalid move! Round wasted."
         
-        winner = "draw"
+        if state.round_number > 3:
+            state.game_active = False
         
-        if user_move == bot_move:
-            winner = "draw"
-        elif user_move == "bomb":
-            winner = "user"
-        elif bot_move == "bomb":
-            winner = "bot"
-        elif (user_move == "rock" and bot_move == "scissors") or \
-             (user_move == "scissors" and bot_move == "paper") or \
-             (user_move == "paper" and bot_move == "rock"):
-            winner = "user"
+        return state.model_dump()
+    
+    # Check bomb usage
+    if user_move == "bomb":
+        if state.user_bomb_used:
+            state.round_number += 1
+            state.last_user_move = user_move
+            state.last_bot_move = ""
+            state.last_result = "You already used your bomb! Round wasted."
+            
+            if state.round_number > 3:
+                state.game_active = False
+            
+            return state.model_dump()
+        state.user_bomb_used = True
+    
+    # Bot makes move
+    bot_move = choose_bot_move(state)
+    if bot_move == "bomb":
+        state.bot_bomb_used = True
+    
+    # Determine winner
+    winner = determine_winner(user_move, bot_move)
+    
+    # Update scores
+    if winner == "user":
+        state.user_score += 1
+        result = "You win this round!"
+    elif winner == "bot":
+        state.bot_score += 1
+        result = "Bot wins this round!"
+    else:
+        result = "It's a draw!"
+    
+    # Update state
+    state.last_user_move = user_move
+    state.last_bot_move = bot_move
+    state.last_result = result
+    state.round_number += 1
+    
+    # Check if game should end
+    if state.round_number > 3:
+        state.game_active = False
+    
+    return state.model_dump()
+
+
+# ============================================================================
+# REFEREE (Replaces AI Agent)
+# ============================================================================
+
+def referee_explain_rules():
+    """Explain game rules"""
+    print("=" * 50)
+    print("ROCK-PAPER-SCISSORS-PLUS RULES:")
+    print("• Best of 3 rounds")
+    print("• Moves: rock, paper, scissors, bomb")
+    print("• bomb beats all (one-time use)")
+    print("• Invalid input wastes the round")
+    print("=" * 50)
+
+
+def referee_announce_round(state: GameState):
+    """Announce round results"""
+    round_num = state.round_number - 1
+    
+    print(f"\n{'='*50}")
+    print(f"ROUND {round_num} RESULTS")
+    print(f"{'='*50}")
+    
+    if state.last_user_move and state.last_bot_move:
+        print(f"You played: {state.last_user_move.upper()}")
+        print(f"Bot played: {state.last_bot_move.upper()}")
+        print(f"\n{state.last_result}")
+    else:
+        print(f"{state.last_result}")
+    
+    print(f"\nCurrent Score:")
+    print(f"  You: {state.user_score}")
+    print(f"  Bot: {state.bot_score}")
+    print(f"{'='*50}\n")
+
+
+def referee_final_result(state: GameState):
+    """Announce final game result"""
+    print("\n" + "=" * 50)
+    print("GAME OVER!")
+    print("=" * 50)
+    print(f"FINAL SCORE: You {state.user_score} - {state.bot_score} Bot")
+    print()
+    
+    if state.user_score > state.bot_score:
+        print("🎉 YOU WIN THE GAME!")
+    elif state.bot_score > state.user_score:
+        print("🤖 BOT WINS THE GAME!")
+    else:
+        print("🤝 IT'S A DRAW!")
+    
+    print("=" * 50)
+
+
+# ============================================================================
+# GAME LOOP
+# ============================================================================
+
+def run_game():
+    """Main game loop"""
+    print("\n🎮 Rock-Paper-Scissors-Plus Game Referee\n")
+    
+    # Initialize game state
+    state = GameState()
+    
+    # Explain rules
+    referee_explain_rules()
+    
+    # Game loop - 3 rounds
+    while state.game_active:
+        current_round = state.round_number
+        print(f"\n>>> ROUND {current_round} <<<")
+        
+        # Show bomb status
+        if state.user_bomb_used:
+            print("⚠️  Your bomb: USED")
         else:
-            winner = "bot"
-
-        # --- Update State ---
-        self.round_count += 1
-        if winner == "user": self.user_score += 1
-        elif winner == "bot": self.bot_score += 1
+            print("💣 Your bomb: AVAILABLE")
         
-        if self.round_count >= self.max_rounds:
-            self.game_over = True
-
-        final_result = None
-        if self.game_over:
-            if self.user_score > self.bot_score: final_result = "User Wins Game!"
-            elif self.bot_score > self.user_score: final_result = "Bot Wins Game!"
-            else: final_result = "Game Ends in Draw!"
-
-        return {
-            "round": self.round_count,
-            "moves": f"User: {user_move} vs Bot: {bot_move}",
-            "round_winner": winner,
-            "scores": f"User: {self.user_score}, Bot: {self.bot_score}",
-            "game_over": self.game_over,
-            "final_result": final_result
-        }
-
-# --- 2. Tool Definition & Agent Configuration ---
-
-def start_game():
-    # Initialize Engine
-    engine = GameEngine()
+        # Get user input
+        user_move = input("\nYour move (rock/paper/scissors/bomb): ").strip()
+        
+        # Process move using the tool
+        result = update_game_state(user_move, state.model_dump())
+        state = GameState(**result)
+        
+        # Announce results
+        referee_announce_round(state)
     
-    # Initialize Client (New SDK)
-    api_key = "AIzaSyAy_aF39dM8QwWaDc67I7ihqmpSZk-v-dI"
-    client = genai.Client(api_key=api_key)
+    # Final result
+    referee_final_result(state)
 
-    # Define Configuration with Tools
-    # In the new SDK, passing the function directly in a list works for Python automatic mapping
-    game_config = types.GenerateContentConfig(
-        tools=[engine.resolve_round],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False),
-        system_instruction="""
-        You are a referee for Rock-Paper-Scissors-Plus.
-        1. Explain rules concisely (max 5 lines) at the start.
-        2. Ask for the user's move.
-        3. CALL 'resolve_round' with the user's move.
-        4. State Round #, Moves, Winner, and Score based purely on tool output.
-        5. If game_over is true, declare the final winner and stop.
-        """
-    )
 
-    # Try different model names
-    models_to_try = [
-        "gemini-2.0-flash-exp",
-        "gemini-2.0-flash", 
-        "gemini-1.5-flash-002",
-        "gemini-1.5-flash-001",
-        "gemini-1.5-pro-002",
-        "gemini-1.5-pro-001"
-    ]
-    chat = None
-    last_error = None
-    
-    print("🔄 Trying to connect to Google ADK...")
-    
-    for model_name in models_to_try:
-        try:
-            chat = client.chats.create(
-                model=model_name,
-                config=game_config
-            )
-            print(f"✓ Successfully connected using: {model_name}\n")
-            break
-        except Exception as e:
-            err_str = str(e)
-            last_error = err_str
-            if "404" in err_str or "NOT_FOUND" in err_str:
-                print(f"  ✗ {model_name}: Model not found")
-            elif "429" in err_str or "quota" in err_str.lower():
-                print(f"  ✗ {model_name}: Quota exceeded")
-            else:
-                print(f"  ✗ {model_name}: {err_str[:60]}")
-            continue
-    
-    if chat is None:
-        print("\n❌ Failed to connect to any model.")
-        print("\nPossible solutions:")
-        print("1. Your API key may have quota issues")
-        print("2. Get a new key: https://aistudio.google.com/app/apikey")
-        print("3. Wait 60 seconds for quota reset")
-        if last_error:
-            print(f"\nLast error: {last_error[:200]}")
-        return
-
-    # --- 3. The Game Loop ---
-    # Initial trigger with retry
-    import time
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = chat.send_message("Start the game.")
-            print(f"Referee:\n{response.text}\n")
-            break
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)
-                    print(f"⏳ Rate limit hit. Waiting {wait_time} seconds before retry {attempt+2}/{max_retries}...")
-                    time.sleep(wait_time)
-                else:
-                    print(f"\n❌ API quota exhausted after {max_retries} attempts.")
-                    print("Your API key has hit its rate limit.")
-                    print("\n🔧 Solutions:")
-                    print("1. Wait 60 seconds and try again")
-                    print("2. Get a NEW API key from: https://aistudio.google.com/app/apikey")
-                    print("3. Check your usage: https://ai.dev/rate-limit")
-                    return
-            else:
-                print(f"Error: {err_str[:150]}")
-                return
-
-    while not engine.game_over:
-        user_input = input("Your Move > ")
-        if not user_input: continue
-
-        try:
-            # The SDK handles the tool call loop automatically
-            response = chat.send_message(user_input)
-            print(f"\nReferee:\n{response.text}")
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                print(f"\n⚠️  Rate limit reached. Waiting 5 seconds...")
-                time.sleep(5)
-                try:
-                    response = chat.send_message(user_input)
-                    print(f"\nReferee:\n{response.text}")
-                except:
-                    print("❌ Still hitting rate limits. Please wait 60 seconds and restart the game.")
-                    break
-            else:
-                print(f"Error: {err_str[:150]}")
-                break
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    start_game()
+    run_game()
